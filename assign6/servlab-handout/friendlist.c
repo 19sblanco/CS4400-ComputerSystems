@@ -1,0 +1,654 @@
+/*
+ * friendlist.c - [Starting code for] a web-based friend-graph manager.
+ *
+ * Based on:
+ *  tiny.c - A simple, iterative HTTP/1.0 Web server that uses the 
+ *      GET method to serve static and dynamic content.
+ *   Tiny Web server
+ *   Dave O'Hallaron
+ *   Carnegie Mellon University
+ */
+#include "csapp.h"
+#include "dictionary.h"
+#include "more_string.h"
+
+
+static void doit(int fd);
+static dictionary_t *read_requesthdrs(rio_t *rp);
+static void read_postquery(rio_t *rp, dictionary_t *headers, dictionary_t *d);
+static void clienterror(int fd, char *cause, char *errnum, 
+                        char *shortmsg, char *longmsg);
+static void print_stringdictionary(dictionary_t *d);
+static void serve_request(int fd, dictionary_t *query);
+static void serve_greet(int fd, dictionary_t *query);
+static void serve_friends(int fd, dictionary_t *query);
+static void serve_befriend(int fd, dictionary_t *query);
+static void serve_unfriend(int fd, dictionary_t *query);
+static void serve_introduce(int fd, dictionary_t *query);
+void* thread_doit(void* args);
+
+static dictionary_t *friends;
+pthread_mutex_t mutex;
+
+
+int main(int argc, char **argv) 
+{
+  friends = make_dictionary(COMPARE_CASE_SENS, free_dictionary);
+
+  int listenfd, connfd;
+  char hostname[MAXLINE], port[MAXLINE];
+  socklen_t clientlen;
+  struct sockaddr_storage clientaddr;
+
+  /* Check command line args */
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s <port>\n", argv[0]);
+    exit(1);
+  }
+
+  listenfd = Open_listenfd(argv[1]);
+
+  /* Don't kill the server if there's an error, because
+     we want to survive errors due to a client. But we
+     do want to report errors. */
+  exit_on_error(0);
+
+  /* Also, don't stop on broken connections: */
+  Signal(SIGPIPE, SIG_IGN);
+
+  pthread_t tid;
+
+  while (1) {
+    clientlen = sizeof(clientaddr);
+    connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+    if (connfd >= 0) {
+      Getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, 
+                  port, MAXLINE, 0);
+      printf("Accepted connection from (%s, %s)\n", hostname, port);
+
+      int* arg = malloc(sizeof(int));
+      *arg = connfd;
+      pthread_create(&tid, NULL, thread_doit, arg);
+      pthread_detach(tid);
+    }
+  }
+}
+
+void* thread_doit(void* args)
+{
+  int fd = *(int*)args;
+  free(args);
+  doit(fd);
+  Close(fd);
+}
+
+/*
+ * doit - handle one HTTP request/response transaction
+ */
+void doit(int fd) 
+{
+  char buf[MAXLINE], *method, *uri, *version;
+  rio_t rio;
+  dictionary_t *headers, *query;
+
+  /* Read request line and headers */
+  Rio_readinitb(&rio, fd);
+  if (Rio_readlineb(&rio, buf, MAXLINE) <= 0)
+    return;
+  printf("%s", buf);
+  
+  if (!parse_request_line(buf, &method, &uri, &version)) {
+    clienterror(fd, method, "400", "Bad Request",
+                "Friendlist did not recognize the request");
+  } else {
+    if (strcasecmp(version, "HTTP/1.0")
+        && strcasecmp(version, "HTTP/1.1")) {
+      clienterror(fd, version, "501", "Not Implemented",
+                  "Friendlist does not implement that version");
+    } else if (strcasecmp(method, "GET")
+               && strcasecmp(method, "POST")) {
+      clienterror(fd, method, "501", "Not Implemented",
+                  "Friendlist does not implement that method");
+    } else {
+      headers = read_requesthdrs(&rio);
+
+      /* Parse all query arguments into a dictionary */
+      query = make_dictionary(COMPARE_CASE_SENS, free);
+      parse_uriquery(uri, query);
+      if (!strcasecmp(method, "POST"))
+        read_postquery(&rio, headers, query);
+
+      /* For debugging, print the dictionary */
+      print_stringdictionary(query);
+
+
+      /* You'll want to handle different queries here,
+         but the intial implementation always returns
+         nothing: */
+      if (starts_with("/greet", uri))
+        serve_greet(fd, query);
+      else if (starts_with("/friends", uri))
+        serve_friends(fd, query);
+      else if (starts_with("/befriend", uri))
+        serve_befriend(fd, query);
+      else if (starts_with("/unfriend", uri))
+        serve_unfriend(fd, query);
+      else if (starts_with("/introduce", uri))
+        serve_introduce(fd, query);
+      else
+        serve_request(fd, query);
+
+      /* Clean up */
+      free_dictionary(query);
+      free_dictionary(headers);
+    }
+
+    /* Clean up status line */
+    free(method);
+    free(uri);
+    free(version);
+  }
+}
+
+/*
+ * read_requesthdrs - read HTTP request headers
+ */
+dictionary_t *read_requesthdrs(rio_t *rp) 
+{
+  char buf[MAXLINE];
+  dictionary_t *d = make_dictionary(COMPARE_CASE_INSENS, free);
+
+  Rio_readlineb(rp, buf, MAXLINE);
+  printf("%s", buf);
+  while(strcmp(buf, "\r\n")) {
+    Rio_readlineb(rp, buf, MAXLINE);
+    printf("%s", buf);
+    parse_header_line(buf, d);
+  }
+  
+  return d;
+}
+
+void read_postquery(rio_t *rp, dictionary_t *headers, dictionary_t *dest)
+{
+  char *len_str, *type, *buffer;
+  int len;
+  
+  len_str = dictionary_get(headers, "Content-Length");
+  len = (len_str ? atoi(len_str) : 0);
+
+  type = dictionary_get(headers, "Content-Type");
+  
+  buffer = malloc(len+1);
+  Rio_readnb(rp, buffer, len);
+  buffer[len] = 0;
+
+  if (!strcasecmp(type, "application/x-www-form-urlencoded")) {
+    parse_query(buffer, dest);
+  }
+
+  free(buffer);
+}
+
+static char *ok_header(size_t len, const char *content_type) {
+  char *len_str, *header;
+  
+  header = append_strings("HTTP/1.0 200 OK\r\n",
+                          "Server: Friendlist Web Server\r\n",
+                          "Connection: close\r\n",
+                          "Content-length: ", len_str = to_string(len), "\r\n",
+                          "Content-type: ", content_type, "\r\n\r\n",
+                          NULL);
+  free(len_str);
+
+  return header;
+}
+
+/*
+ * serve_request - example request handler
+ */
+static void serve_request(int fd, dictionary_t *query)
+{
+  size_t len;
+  char *body, *header;
+
+  body = strdup("alice\nbob");
+
+  len = strlen(body);
+
+  /* Send response headers to client */
+  header = ok_header(len, "text/html; charset=utf-8");
+  Rio_writen(fd, header, strlen(header));
+  printf("Response headers:\n");
+  printf("%s", header);
+
+  free(header);
+
+  /* Send response body to client */
+  Rio_writen(fd, body, len);
+
+  free(body);
+}
+
+/*
+ * serve requestions that start w/ /greet
+ */
+static void serve_greet(int fd, dictionary_t *query)
+{
+  size_t len;
+  char *body, *header;
+  
+  char* user = dictionary_get(query, "user");
+
+  body = append_strings("Greetings, ", user, "!", NULL);
+
+  len = strlen(body);
+
+  /* Send response headers to client */
+  header = ok_header(len, "text/html; charset=utf-8");
+  Rio_writen(fd, header, strlen(header));
+  printf("Response headers:\n");
+  printf("%s", header);
+
+  free(header);
+
+  /* Send response body to client */
+  Rio_writen(fd, body, len);
+
+  free(body);
+}
+
+/*
+ * send on socket a list of friends to <user>
+ * where each friend is \n serperated
+ */
+static void serve_friends(int fd, dictionary_t *query)
+{
+
+  size_t len;
+  char *body, *header;
+
+  char* user = dictionary_get(query, "user");
+
+  pthread_mutex_lock(&mutex);
+
+  // if user is new, add him to friends dictionary
+  if (dictionary_get(friends, user) == NULL) 
+  {
+    dictionary_t* new_user_friends = make_dictionary(COMPARE_CASE_SENS, NULL);
+    dictionary_set(friends, user, new_user_friends);
+  }
+
+
+  dictionary_t* user_friends = dictionary_get(friends, user);
+
+  char** friends_names = dictionary_keys(user_friends);
+
+  body = join_strings(friends_names, '\n');
+
+  pthread_mutex_unlock(&mutex);
+
+  len = strlen(body);
+
+  /* Send response headers to client */
+  header = ok_header(len, "text/html; charset=utf-8");
+  Rio_writen(fd, header, strlen(header));
+  printf("===sending back===\n");
+  printf("%s", header);
+
+  free(header);
+
+  /* Send response body to client */
+  Rio_writen(fd, body, len);
+  printf("%s", body);
+  printf("============\n");
+  
+  free(body);
+}
+
+/*
+ /befriend?user=‹user›&friends=‹friends›
+ 
+ — Adds each user in ‹friends› as a friend of ‹user›, which implies adding ‹user› as a friend of each user in ‹friends›. The ‹friends› list can be a single user or multiple newline-separated user names, and ‹friends› can optionally end with a newline character.
+ */
+static void serve_befriend(int fd, dictionary_t *query)
+{
+  size_t len;
+  char* body, *header;
+
+  char* user = dictionary_get(query, "user");
+  char* friends_str = dictionary_get(query, "friends");
+  char** new_user_friends = split_string(friends_str, '\n');
+
+  pthread_mutex_lock(&mutex);
+
+  /*
+   * add those that are new to the global friends dictionary
+   */
+  // if user is new, add him to friends dictionary
+  if (dictionary_get(friends, user) == NULL) 
+  {
+    dictionary_t* adding_user_friend = make_dictionary(COMPARE_CASE_SENS, NULL);
+    dictionary_set(friends, user, adding_user_friend);
+  }
+  // if any friends are new add them to the dictionary
+  for (int i = 0; new_user_friends[i] != NULL; i++)
+  {
+    if (dictionary_get(friends, new_user_friends[i]) == NULL)
+    {
+      dictionary_t* adding_user_friend = make_dictionary(COMPARE_CASE_SENS, NULL);
+      dictionary_set(friends, new_user_friends[i], adding_user_friend);
+    }
+  }
+
+  /*
+   * make everyone friends
+   */
+  // for every friend, if they aren't in users friend list, add them
+  dictionary_t* user_dict = dictionary_get(friends, user);
+  for (int i = 0; new_user_friends[i] != NULL; i++)
+  {
+    if (strcmp(user, new_user_friends[i]) == 0)
+      continue;
+
+    if (dictionary_get(user_dict, new_user_friends[i]) == NULL)
+    {
+      dictionary_set(user_dict, new_user_friends[i], NULL);
+    }
+  }
+  // for every firends, if they don't have user as a friend
+  for (int i = 0; new_user_friends[i] != NULL; i++)
+  {
+    if (strcmp(user, new_user_friends[i]) == 0)
+      continue;
+
+    dictionary_t* friend_dict = dictionary_get(friends, new_user_friends[i]);
+    if (dictionary_get(friend_dict, user) == NULL)
+    {
+      dictionary_set(friend_dict, user, NULL);
+    }
+  }
+
+
+  char** user_friends = dictionary_keys(user_dict);
+  body = join_strings(user_friends, '\n');
+  len = strlen(body);
+
+  pthread_mutex_unlock(&mutex);
+
+  /* Send response headers to client */
+  header = ok_header(len, "text/html; charset=utf-8");
+  Rio_writen(fd, header, strlen(header));
+  printf("===sending back=== \n");
+  printf("%s", header);
+
+  free(header);
+
+  /* Send response body to client */
+  Rio_writen(fd, body, len);
+  printf("%s", body);
+  printf("============= \n");
+
+  free(body);
+  for (int i = 0; new_user_friends[i] != NULL; i++)
+  {
+    free(new_user_friends[i]);
+  }
+  free(new_user_friends);
+}
+
+/*
+ *
+ */
+static void serve_unfriend(int fd, dictionary_t *query)
+{
+  size_t len;
+  char* body, *header;
+
+  char* user = dictionary_get(query, "user");
+  char* friends_str = dictionary_get(query, "friends");
+  char** new_user_friends = split_string(friends_str, '\n');
+
+
+  /*
+   * unfriend everyone
+   */
+  dictionary_t* user_dict = dictionary_get(friends, user);
+  if (user_dict != NULL)
+  {
+    
+      pthread_mutex_lock(&mutex);
+
+
+      for (int i = 0; new_user_friends[i] != NULL; i++)
+      {
+          dictionary_remove(user_dict, new_user_friends[i]);
+      }
+      // for every friends, if they do have user as a friend
+      for (int i = 0; new_user_friends[i] != NULL; i++)
+      {
+        dictionary_t* friend_dict = dictionary_get(friends, new_user_friends[i]);
+        if (friend_dict != NULL)
+          dictionary_remove(friend_dict, user);
+      }
+
+      char** user_friends = dictionary_keys(user_dict);
+      body = join_strings(user_friends, '\n');
+      len = strlen(body);
+
+      pthread_mutex_unlock(&mutex);
+  }
+
+  /* Send response headers to client */
+  header = ok_header(len, "text/html; charset=utf-8");
+  Rio_writen(fd, header, strlen(header));
+  printf("===sending back=== \n");
+  printf("%s", header);
+
+  free(header);
+
+  /* Send response body to client */
+  Rio_writen(fd, body, len);
+  printf("%s\n", body);
+  printf("====== \n");
+
+  free(body);
+  for (int i = 0; new_user_friends[i] != NULL; i++)
+  {
+    free(new_user_friends[i]);
+  }
+  free(new_user_friends);
+}
+
+/*
+ * open clident fd give it a port and host
+ */
+static void serve_introduce(int fd, dictionary_t *query)
+{
+  size_t len;
+  char* body, *header;
+  char* host = dictionary_get(query, "host");
+  char* port = dictionary_get(query, "port");
+  char* user = dictionary_get(query, "user");
+  char* friend = dictionary_get(query, "friend");
+
+
+  int connection_fd = Open_clientfd(host, port);
+  char* friend_encode = query_encode(friend);
+  char* http_request = append_strings("GET /friends?user=", friend_encode, " HTTP/1.0\r\n\r\n", NULL);
+  rio_writen(connection_fd, http_request, strlen(http_request));
+
+  char buf[MAXLINE];
+  rio_t rio;
+  Rio_readinitb(&rio, connection_fd);
+  Rio_readlineb(&rio, buf, MAXLINE);
+  char *version_p, *status_p, *desc_p;
+  int success = parse_status_line(buf, &version_p, &status_p, &desc_p);
+  if(strcmp(status_p, "200") != 0)
+    return;
+  free(version_p);
+  free(status_p);
+  free(desc_p);
+
+  dictionary_t* head = read_requesthdrs(&rio);
+  parse_header_line(buf, head);
+  char* content_length = dictionary_get(head, "Content-length");
+  int buf_size = atoi(content_length);
+
+  char* buf2 = malloc(buf_size + 1);
+  Rio_readnb(&rio, buf2, buf_size);
+  buf2[buf_size] = 0;
+
+
+  char** new_user_friends = split_string(buf2, '\n');
+  free(buf2);
+  pthread_mutex_lock(&mutex);
+  /*
+   * add those that are new to the global friends dictionary
+   */
+  // if user is new, add him to friends dictionary
+  if (dictionary_get(friends, user) == NULL) 
+  {
+    dictionary_t* adding_user_friend = make_dictionary(COMPARE_CASE_SENS, NULL);
+    dictionary_set(friends, user, adding_user_friend);
+  }
+  // if any friends are new add them to the dictionary
+  for (int i = 0; new_user_friends[i] != NULL; i++)
+  {
+    if (dictionary_get(friends, new_user_friends[i]) == NULL)
+    {
+      dictionary_t* adding_user_friend = make_dictionary(COMPARE_CASE_SENS, NULL);
+      dictionary_set(friends, new_user_friends[i], adding_user_friend);
+    }
+  }
+  /*
+   * make everyone friends
+   */
+  // for every friend, if they aren't in users friend list, add them
+  dictionary_t* user_dict = dictionary_get(friends, user);
+  for (int i = 0; new_user_friends[i] != NULL; i++)
+  { 
+    //todo maybe uncomment
+    if (strcmp(user, new_user_friends[i]) == 0)
+      continue;
+
+    if (dictionary_get(user_dict, new_user_friends[i]) == NULL)
+    {
+      dictionary_set(user_dict, new_user_friends[i], NULL);
+    }
+  }
+  // for every firends, if they don't have user as a friend
+  for (int i = 0; new_user_friends[i] != NULL; i++)
+  {
+    dictionary_t* friend_dict = dictionary_get(friends, new_user_friends[i]);
+
+    if (strcmp(user, new_user_friends[i]) == 0)
+      continue;
+
+    if (dictionary_get(friend_dict, user) == NULL)
+    {
+      dictionary_set(friend_dict, user, NULL);
+    }
+  }
+
+  if (strcmp(user, friend) != 0)
+  {
+    if (dictionary_get(friends, friend) == NULL)
+    {
+      dictionary_t* adding_user_friend = make_dictionary(COMPARE_CASE_SENS, NULL);
+      dictionary_set(friends, user, adding_user_friend);
+    }
+    
+    dictionary_t* user_dict = dictionary_get(friends, user);
+    dictionary_t* friend_dict = dictionary_get(friends, friend);
+
+    if (dictionary_get(user_dict, friend) == NULL) // if not friends
+    {
+      dictionary_set(user_dict, friend, NULL);
+      dictionary_set(friend_dict, user, NULL);
+    }
+  }
+
+
+  char** user_friends = dictionary_keys(user_dict);
+  body = join_strings(user_friends, '\n');
+  len = strlen(body);
+
+  pthread_mutex_unlock(&mutex);
+
+  /* Send response headers to client */
+  header = ok_header(len, "text/html; charset=utf-8");
+  Rio_writen(fd, header, strlen(header));
+  printf("===sending back=== \n");
+  printf("%s", header);
+
+  free(header);
+
+  /* Send response body to client */
+  Rio_writen(fd, body, len);
+  printf("%s", body);
+  printf("============= \n");
+
+
+  for (int i = 0; new_user_friends[i] != NULL; i++)
+  {
+    free(new_user_friends[i]);
+  }
+  free(new_user_friends);
+  Free(body);
+}
+
+
+
+/*
+ * clienterror - returns an error message to the client
+ */
+void clienterror(int fd, char *cause, char *errnum, 
+		 char *shortmsg, char *longmsg) 
+{
+  size_t len;
+  char *header, *body, *len_str;
+
+  body = append_strings("<html><title>Friendlist Error</title>",
+                        "<body bgcolor=""ffffff"">\r\n",
+                        errnum, " ", shortmsg,
+                        "<p>", longmsg, ": ", cause,
+                        "<hr><em>Friendlist Server</em>\r\n",
+                        NULL);
+  len = strlen(body);
+
+  /* Print the HTTP response */
+  header = append_strings("HTTP/1.0 ", errnum, " ", shortmsg, "\r\n",
+                          "Content-type: text/html; charset=utf-8\r\n",
+                          "Content-length: ", len_str = to_string(len), "\r\n\r\n",
+                          NULL);
+  free(len_str);
+  
+  Rio_writen(fd, header, strlen(header));
+  Rio_writen(fd, body, len);
+
+  free(header);
+  free(body);
+}
+
+static void print_stringdictionary(dictionary_t *d)
+{
+  int i, count;
+
+  count = dictionary_count(d);
+  for (i = 0; i < count; i++) {
+    printf("%s=%s\n",
+           dictionary_key(d, i),
+           (const char *)dictionary_value(d, i));
+  }
+  printf("\n");
+}
+
+/*
+  printf("printing output from other server\n");
+  printf("%s\n", friend);
+  for (int i = 0; new_user_friends[i] != NULL; i++)
+  {
+    printf("%s\n", new_user_friends[i]);
+  }
+  */
